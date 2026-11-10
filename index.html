@@ -1551,7 +1551,7 @@ function makePeerLobby() {
     };
     const fail = (msg, p) => { if (settled) return; settled = true; clearTimeout(timer); try { p && p.destroy(); } catch (e) {} reject(new Error(msg)); };
     const ok = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(room); };
-    const timer = setTimeout(() => fail('연결 시간이 초과됐어요. 인터넷 상태를 확인하고 다시 시도해 주세요.', me), 15000);
+    const timer = setTimeout(() => fail('연결 시간이 초과됐어요. 인터넷 상태를 확인하고 다시 시도해 주세요.', me), 40000);
     const cleanPr = pr => (pr && typeof pr === 'object' && !Array.isArray(pr)) ? pr : {};
     const broadcastAll = () => {
       bcastTimer = null;
@@ -1597,30 +1597,45 @@ function makePeerLobby() {
         c.on('close', gone); c.on('error', gone);
       });
       p.on('error', err => {
-        if (!settled) fail(err.type === 'unavailable-id' ? '같은 코드의 방이 이미 있어요. 방을 다시 만들어 주세요.' : '연결 서버에 접속하지 못했어요. 잠시 후 다시 시도해 주세요.', p);
+        if (!settled) fail(err.type === 'unavailable-id' ? '같은 코드의 방이 이미 있어요. 방을 다시 만들어 주세요.' : `연결 서버에 접속하지 못했어요. 잠시 후 다시 시도해 주세요. (원인: ${err.type})`, p);
         else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') { try { p.reconnect(); } catch (e) {} }
       });
       p.on('disconnected', () => { if (!closed) setTimeout(() => { try { if (!p.destroyed) p.reconnect(); } catch (e) {} }, 1000); });
     } else {
-      // 참가자: 아무 이름으로 접속한 뒤 방장에게 직접 연결
-      const p = new PeerCls({debug: 0});
-      p.on('open', () => {
-        me = p;
-        const c = p.connect(hubId, {serialization: 'json'});
-        c.on('open', () => { hubConn = c; ok(); try { c.send({t: 'p', pr: mine}); } catch (e) {} fire(); });
-        c.on('data', d => {
-          if (!d || d.t !== 'all' || typeof d.ps !== 'object') return;
-          others.clear();
-          for (const k in d.ps) if (k !== p.id) others.set(k, cleanPr(d.ps[k]));
-          fire();
+      // 참가자: 아무 이름으로 접속한 뒤 방장에게 직접 연결 (공용 서버가 잠깐 불안정할 수 있어 최대 3번 시도)
+      const attempt = (n) => {
+        if (settled) return;
+        const p = new PeerCls({debug: 0});
+        let thisDone = false;
+        const retryOr = (msg) => {
+          if (thisDone || settled) return; thisDone = true;
+          try { p.destroy(); } catch (e) {}
+          if (n < 3) { $('mpNote').textContent = `연결 재시도 중… (${n + 1}/3)`; setTimeout(() => attempt(n + 1), 1200); }
+          else fail(msg);
+        };
+        p.on('open', () => {
+          me = p;
+          const c = p.connect(hubId, {serialization: 'json'});
+          const connTimer = setTimeout(() => retryOr('방장과 직접 연결이 되지 않아요. (원인: 연결 시간 초과 — 네트워크가 직접 연결을 막고 있을 수 있어요)'), 9000);
+          c.on('open', () => { clearTimeout(connTimer); thisDone = true; hubConn = c; ok(); try { c.send({t: 'p', pr: mine}); } catch (e) {} fire(); });
+          c.on('data', d => {
+            if (!d || d.t !== 'all' || typeof d.ps !== 'object') return;
+            others.clear();
+            for (const k in d.ps) if (k !== p.id) others.set(k, cleanPr(d.ps[k]));
+            fire();
+          });
+          c.on('close', () => { clearTimeout(connTimer); if (settled && hubConn === c) lost('방장이 나가서 방이 닫혔어요.'); else retryOr('방장과 연결하지 못했어요. (원인: 연결이 닫힘)'); });
+          c.on('error', (err) => { clearTimeout(connTimer); if (settled && hubConn === c) lost('방장과의 연결이 끊겼어요.'); else retryOr(`방장과 연결하지 못했어요. (원인: ${(err && err.type) || '연결 오류'})`); });
         });
-        c.on('close', () => settled ? lost('방장이 나가서 방이 닫혔어요.') : fail('방에 연결하지 못했어요.', p));
-        c.on('error', () => settled ? lost('방장과의 연결이 끊겼어요.') : fail('방에 연결하지 못했어요.', p));
-      });
-      p.on('error', err => {
-        if (!settled) fail(err.type === 'peer-unavailable' ? '그 코드의 방을 찾을 수 없어요. 코드를 확인해 주세요.' : '방장과 연결하지 못했어요. 네트워크 환경에 따라 직접 연결이 막힐 수 있어요.', p);
-        else if (err.type === 'peer-unavailable' || err.type === 'webrtc') lost('방장과의 연결이 끊겼어요.');
-      });
+        p.on('error', err => {
+          const type = (err && err.type) || 'unknown';
+          if (settled && hubConn) { if (type === 'peer-unavailable' || type === 'webrtc') lost('방장과의 연결이 끊겼어요.'); return; }
+          if (type === 'peer-unavailable') { thisDone = true; try { p.destroy(); } catch (e) {} fail('그 코드의 방을 찾을 수 없어요. 코드를 확인하고, 방장이 게임 창을 켜 두었는지 확인해 주세요.'); return; }
+          const why = {network: '연결 서버에 닿지 못함', 'server-error': '연결 서버 응답 없음', 'socket-error': '연결 서버 통신 오류', 'socket-closed': '연결 서버 통신 끊김', webrtc: '브라우저끼리 직접 연결 실패', 'browser-incompatible': '이 브라우저는 직접 연결을 지원하지 않음', disconnected: '연결 서버와 끊김'}[type] || type;
+          retryOr(`방장과 연결하지 못했어요. (원인: ${why} · ${type})`);
+        });
+      };
+      attempt(1);
     }
   })};
 }
