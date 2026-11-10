@@ -147,7 +147,7 @@
   <button class="go" id="startBtn">혼자 레이스 시작</button>
   <div class="mp">
     <div class="mpt">👥 친구와 함께 달리기</div>
-    <div class="mpd">방을 만들고 코드를 알려주면, 이 게임 페이지를 공유받은 사람이 같은 코드로 들어와 함께 달릴 수 있어요.</div>
+    <div class="mpd">방을 만들고 코드를 알려주면, 친구가 같은 주소에서 코드를 입력해 함께 달릴 수 있어요. (방을 만든 사람이 나가면 방이 닫혀요)</div>
     <input id="nick" maxlength="10" placeholder="닉네임" style="width:100%;box-sizing:border-box">
     <div class="mrow"><button class="sec" id="mkRoom">방 만들기</button><input id="codeIn" maxlength="6" placeholder="방 코드"><button class="sec ghost" id="joinRoom">참가</button></div>
     <div id="mpNote"></div>
@@ -170,7 +170,17 @@
   <div id="resMp" style="display:none;margin-top:12px"><button class="sec ghost" id="resLobby">로비로</button></div>
 </div></div>
 
+<!-- (선택) 비워 두면 가입·설정 없이 PeerJS로 브라우저끼리 직접 연결돼요.
+     연결이 잘 안 되는 환경이면 Supabase 주소와 공개 키를 넣어 Supabase로 연결할 수 있어요. -->
+<script>
+window.GAME_CONFIG = {
+  SUPABASE_URL: '',       // 예: 'https://abcdefgh.supabase.co'
+  SUPABASE_KEY: ''        // 예: 'sb_publishable_...' 또는 anon 키 'eyJhbGciOi...' (secret/service_role 키는 절대 넣지 마세요)
+};
+</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.5/dist/peerjs.min.js"></script>
 <script>
 (() => {
 'use strict';
@@ -1490,7 +1500,7 @@ function renderLobby() {
 }
 async function mpEnter(code, creator) {
   const note = $('mpNote');
-  if (!MP.lobby) { note.textContent = '이 화면에서는 함께하기 기능을 쓸 수 없어요 (claude.ai에서 로그인한 상태로 열어 주세요).'; return; }
+  if (!MP.lobby) { note.textContent = '함께하기 연결을 준비하지 못했어요. 새로고침해 보세요.'; return; }
   const nick = $('nick').value.trim().slice(0, 10);
   if (!nick) { note.textContent = '닉네임을 먼저 입력해 주세요.'; $('nick').focus(); return; }
   code = code.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 6);
@@ -1499,10 +1509,10 @@ async function mpEnter(code, creator) {
   if (!ac) initAudio(); else if (ac.state === 'suspended') ac.resume();
   note.textContent = '연결 중…';
   try {
-    MP.room = await MP.lobby.join('race-' + code);
-  } catch (e) { note.textContent = '방에 들어가지 못했어요. 잠시 후 다시 시도해 주세요.'; return; }
+    MP.room = await MP.lobby.join('race-' + code, {creator});
+  } catch (e) { note.textContent = (e && /[가-힣]/.test(e.message || '')) ? e.message : '방에 들어가지 못했어요. 잠시 후 다시 시도해 주세요.'; return; }
   Object.assign(MP, {on: true, code, nick, creator, raceId: 0, raceInfo: null, seenRace: null, grid: [], waiting: false, hostAi: null});
-  MP.unsub = MP.room.onPeers(() => mpSync(), () => { note.textContent = '연결이 끊겼어요.'; mpLeave(); });
+  MP.unsub = MP.room.onPeers(() => mpSync(), (e) => { mpLeave(); $('mpNote').textContent = (e && e.message && /[가-힣]/.test(e.message)) ? e.message : '연결이 끊겼어요.'; });
   note.textContent = '';
   $('menu').style.display = 'none'; $('lobby').style.display = 'flex';
   state = 'menu'; renderLobby();
@@ -1518,9 +1528,189 @@ function mpLeave() {
   resetRace(); state = 'menu'; $('lights').style.opacity = 0; setLights(0);
   $('menu').style.display = 'flex';
 }
+// ---------- 설정 없이 쓰는 연결: PeerJS (브라우저끼리 직접 연결, 방장이 중계) ----------
+// 방을 만든 사람의 브라우저가 'formularush-방코드' 이름으로 대기하고, 참가자는 거기에 직접 접속해요.
+// 방장은 모두의 상태를 모아 초당 약 15회 전체에 다시 보내요. (방장이 나가면 방이 닫혀요)
+function makePeerLobby() {
+  const PeerCls = window.Peer || (window.peerjs && window.peerjs.Peer);
+  if (!PeerCls) return null;
+  return {join: (name, opts = {}) => new Promise((resolve, reject) => {
+    const hubId = 'formularush-' + name;
+    const others = new Map(), conns = new Map(), handlers = [], errHandlers = [];
+    let me = null, isHub = false, hubConn = null, settled = false, closed = false;
+    let mine = {}, snap = null, dirty = true, queued = false, lastSend = 0, bcastTimer = null;
+    const fire = () => {
+      dirty = true;
+      if (queued) return; queued = true;
+      setTimeout(() => { queued = false; const ps = room.peers(); handlers.slice().forEach(h => { try { h({peers: ps, joined: [], left: [], updated: []}); } catch (e) { console.error(e); } }); }, 0);
+    };
+    const lost = (msg) => {
+      if (closed) return; closed = true;
+      errHandlers.forEach(h => { try { h({code: 'upstream_error', message: msg}); } catch (e) {} });
+      try { me && me.destroy(); } catch (e) {}
+    };
+    const fail = (msg, p) => { if (settled) return; settled = true; clearTimeout(timer); try { p && p.destroy(); } catch (e) {} reject(new Error(msg)); };
+    const ok = () => { if (settled) return; settled = true; clearTimeout(timer); resolve(room); };
+    const timer = setTimeout(() => fail('연결 시간이 초과됐어요. 인터넷 상태를 확인하고 다시 시도해 주세요.', me), 15000);
+    const cleanPr = pr => (pr && typeof pr === 'object' && !Array.isArray(pr)) ? pr : {};
+    const broadcastAll = () => {
+      bcastTimer = null;
+      const ps = {[me.id]: mine}; for (const [k, v] of others) ps[k] = v;
+      for (const c of conns.values()) if (c.open) { try { c.send({t: 'all', ps}); } catch (e) {} }
+    };
+    const scheduleBroadcast = () => { if (!bcastTimer) bcastTimer = setTimeout(broadcastAll, 66); };
+    const room = {
+      name,
+      presence(patch) {
+        mine = Object.assign({}, mine);
+        for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
+        dirty = true;
+        if (isHub) scheduleBroadcast();
+        else if (hubConn && hubConn.open) {
+          const now = performance.now();
+          if (now - lastSend >= 60) { lastSend = now; try { hubConn.send({t: 'p', pr: mine}); } catch (e) {} }
+        }
+        return Promise.resolve();
+      },
+      peers() {
+        if (!dirty && snap) return snap;
+        const out = [];
+        const myId = me ? me.id : 'me';
+        out.push(Object.freeze({peer: myId, by: null, isMe: true, sameTab: true, kind: 'viewer', guest: false, presence: Object.freeze(Object.assign({}, mine)), updatedAt: Date.now()}));
+        for (const [k, v] of others) out.push(Object.freeze({peer: k, by: null, isMe: false, sameTab: false, kind: 'viewer', guest: false, presence: Object.freeze(Object.assign({}, v)), updatedAt: Date.now()}));
+        snap = Object.freeze(out); dirty = false;
+        return snap;
+      },
+      onPeers(h, onErr) { handlers.push(h); if (onErr) errHandlers.push(onErr); setTimeout(fire, 0); return () => { const i = handlers.indexOf(h); if (i >= 0) handlers.splice(i, 1); }; },
+      connected: () => !closed && !!me,
+      async leave() { closed = true; clearTimeout(bcastTimer); try { me && me.destroy(); } catch (e) {} },
+      emit: () => Promise.resolve(), on: () => () => {}
+    };
+    if (opts.creator) {
+      // 방장: 방 코드로 된 고정 이름을 차지하고 참가자를 기다림
+      const p = new PeerCls(hubId, {debug: 0});
+      p.on('open', () => { me = p; isHub = true; ok(); fire(); });
+      p.on('connection', c => {
+        c.on('open', () => { conns.set(c.peer, c); scheduleBroadcast(); });
+        c.on('data', d => { if (d && d.t === 'p') { others.set(c.peer, cleanPr(d.pr)); fire(); scheduleBroadcast(); } });
+        const gone = () => { conns.delete(c.peer); if (others.delete(c.peer)) { fire(); scheduleBroadcast(); } };
+        c.on('close', gone); c.on('error', gone);
+      });
+      p.on('error', err => {
+        if (!settled) fail(err.type === 'unavailable-id' ? '같은 코드의 방이 이미 있어요. 방을 다시 만들어 주세요.' : '연결 서버에 접속하지 못했어요. 잠시 후 다시 시도해 주세요.', p);
+        else if (err.type === 'network' || err.type === 'server-error' || err.type === 'socket-error') { try { p.reconnect(); } catch (e) {} }
+      });
+      p.on('disconnected', () => { if (!closed) setTimeout(() => { try { if (!p.destroyed) p.reconnect(); } catch (e) {} }, 1000); });
+    } else {
+      // 참가자: 아무 이름으로 접속한 뒤 방장에게 직접 연결
+      const p = new PeerCls({debug: 0});
+      p.on('open', () => {
+        me = p;
+        const c = p.connect(hubId, {serialization: 'json'});
+        c.on('open', () => { hubConn = c; ok(); try { c.send({t: 'p', pr: mine}); } catch (e) {} fire(); });
+        c.on('data', d => {
+          if (!d || d.t !== 'all' || typeof d.ps !== 'object') return;
+          others.clear();
+          for (const k in d.ps) if (k !== p.id) others.set(k, cleanPr(d.ps[k]));
+          fire();
+        });
+        c.on('close', () => settled ? lost('방장이 나가서 방이 닫혔어요.') : fail('방에 연결하지 못했어요.', p));
+        c.on('error', () => settled ? lost('방장과의 연결이 끊겼어요.') : fail('방에 연결하지 못했어요.', p));
+      });
+      p.on('error', err => {
+        if (!settled) fail(err.type === 'peer-unavailable' ? '그 코드의 방을 찾을 수 없어요. 코드를 확인해 주세요.' : '방장과 연결하지 못했어요. 네트워크 환경에 따라 직접 연결이 막힐 수 있어요.', p);
+        else if (err.type === 'peer-unavailable' || err.type === 'webrtc') lost('방장과의 연결이 끊겼어요.');
+      });
+    }
+  })};
+}
+// ---------- claude.ai 밖(Vercel 등)에서 쓰는 실시간 연결: Supabase Realtime ----------
+// 게임 코드가 쓰는 방(room) 인터페이스(join / presence / peers / onPeers / leave)를 그대로 흉내 냄.
+// - 자주 바뀌는 차 위치(st)와 AI 상태(ai)는 Broadcast로 초당 5회 전송 (무료 플랜: 프로젝트 전체 초당 100메시지)
+// - 거의 안 바뀌는 닉네임·호스트·레이스 정보는 Presence로 전송 (클라이언트당 30초에 5회 제한 → 변경 시에만, 간격 두고)
+function makeSupabaseLobby() {
+  const cfg = window.GAME_CONFIG || {};
+  if (!cfg.SUPABASE_URL || !cfg.SUPABASE_KEY || !window.supabase) return null;
+  const client = window.supabase.createClient(cfg.SUPABASE_URL, cfg.SUPABASE_KEY);
+  const myPeer = Math.random().toString(36).slice(2, 12);
+  const SLOW_KEYS = ['nick', 'host', 'race'];
+  return {join: (name) => new Promise((resolve, reject) => {
+    const ch = client.channel(name, {config: {broadcast: {self: false}, presence: {key: myPeer}}});
+    const slow = new Map(), fast = new Map(), handlers = [];
+    let mine = {}, sentSlow = '', lastTrack = 0, trackTimer = null, lastFast = 0, subscribed = false, snap = null, dirty = true, queued = false;
+    const fire = () => {
+      dirty = true;
+      if (queued) return; queued = true;
+      setTimeout(() => { queued = false; const ps = room.peers(); handlers.slice().forEach(h => { try { h({peers: ps, joined: [], left: [], updated: []}); } catch (e) { console.error(e); } }); }, 0);
+    };
+    const slowOf = o => { const s = {}; SLOW_KEYS.forEach(k => { if (o[k] !== undefined && o[k] !== null) s[k] = o[k]; }); return s; };
+    const flushSlow = () => {
+      if (!subscribed) return;
+      const s = slowOf(mine), js = JSON.stringify(s);
+      if (js === sentSlow) return;
+      const wait = 1600 - (performance.now() - lastTrack);
+      if (wait > 0) { if (!trackTimer) trackTimer = setTimeout(() => { trackTimer = null; flushSlow(); }, wait); return; }
+      sentSlow = js; lastTrack = performance.now();
+      ch.track(s).catch(() => { sentSlow = ''; });
+    };
+    const room = {
+      name,
+      presence(patch) {
+        mine = Object.assign({}, mine);
+        for (const k in patch) { if (patch[k] === null) delete mine[k]; else mine[k] = patch[k]; }
+        dirty = true;
+        flushSlow();
+        const now = performance.now();
+        if (subscribed && now - lastFast >= 200) {
+          lastFast = now;
+          ch.send({type: 'broadcast', event: 's', payload: {p: myPeer, st: mine.st || null, ai: mine.ai || null}}).catch(() => {});
+        }
+        return Promise.resolve();
+      },
+      peers() {
+        if (!dirty && snap) return snap;
+        const keys = new Set([myPeer, ...slow.keys()]), out = [];
+        for (const k of keys) {
+          const isMe = k === myPeer;
+          const pr = isMe ? Object.assign({}, mine) : Object.assign({}, slow.get(k) || {}, fast.get(k) || {});
+          out.push(Object.freeze({peer: k, by: null, isMe, sameTab: isMe, kind: 'viewer', guest: false, presence: Object.freeze(pr), updatedAt: Date.now()}));
+        }
+        snap = Object.freeze(out); dirty = false;
+        return snap;
+      },
+      onPeers(h) { handlers.push(h); setTimeout(fire, 0); return () => { const i = handlers.indexOf(h); if (i >= 0) handlers.splice(i, 1); }; },
+      connected: () => subscribed,
+      async leave() { clearTimeout(trackTimer); try { await ch.untrack(); } catch (e) {} try { client.removeChannel(ch); } catch (e) {} },
+      emit: () => Promise.resolve(), on: () => () => {}
+    };
+    ch.on('presence', {event: 'sync'}, () => {
+      const state = ch.presenceState();
+      slow.clear();
+      for (const k in state) { const metas = state[k]; if (k !== myPeer && metas && metas.length) { const m = Object.assign({}, metas[metas.length - 1]); delete m.presence_ref; slow.set(k, m); } }
+      for (const k of [...fast.keys()]) if (!slow.has(k)) fast.delete(k);
+      fire();
+    });
+    ch.on('broadcast', {event: 's'}, ({payload}) => {
+      if (!payload || typeof payload.p !== 'string' || payload.p === myPeer) return;
+      fast.set(payload.p, {st: payload.st || null, ai: Array.isArray(payload.ai) ? payload.ai : null});
+      fire();
+    });
+    let settled = false;
+    ch.subscribe((status) => {
+      if (status === 'SUBSCRIBED') {
+        subscribed = true; sentSlow = ''; flushSlow();
+        if (!settled) { settled = true; resolve(room); }
+      } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+        subscribed = false;
+        if (!settled) { settled = true; try { client.removeChannel(ch); } catch (e) {} reject(new Error(status)); }
+      }
+    });
+  })};
+}
 try { $('nick').value = localStorage.getItem('fr_nick') || ''; } catch (e) {}
 (window.claude && typeof window.claude.use === 'function' ? window.claude.use('room') : Promise.resolve(null))
-  .then(r => { MP.lobby = r; if (!r) $('mpNote').textContent = '함께하기는 claude.ai에서 이 페이지를 열었을 때만 쓸 수 있어요.'; })
+  .then(r => r || makeSupabaseLobby() || makePeerLobby())
+  .then(r => { MP.lobby = r; if (!r) $('mpNote').textContent = '함께하기 연결 라이브러리를 불러오지 못했어요. 새로고침해 보세요.'; })
   .catch(() => { $('mpNote').textContent = '함께하기 기능에 연결하지 못했어요.'; });
 $('mkRoom').addEventListener('click', () => mpEnter(Math.random().toString(36).slice(2, 7).replace(/[^a-z0-9]/g, 'x').padEnd(5, '7'), true));
 $('joinRoom').addEventListener('click', () => mpEnter($('codeIn').value, false));
